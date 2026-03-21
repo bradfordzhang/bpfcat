@@ -1,5 +1,6 @@
 # Project variables
 BINARY_NAME=bpfcat
+export GOEXPERIMENT=newinliner,runtimefreegc,simd
 CLANG ?= clang
 STRIP ?= llvm-strip
 ARCH ?= $(shell uname -m)

@@ -9,6 +9,8 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      GOEXPERIMENT: newinliner,runtimefreegc,simd
 
     steps:
     - name: Checkout code
