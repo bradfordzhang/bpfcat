@@ -1,0 +1,36 @@
+# Binaries
+bpfcat
+bpfcat_test
+
+# eBPF Generated files
+# We ignore these because they can be regenerated via 'make'
+bpfcat_bpfel.go
+bpfcat_bpfel.o
+bpfcat_bpfeb.go
+bpfcat_bpfeb.o
+
+# Object files
+*.o
+*.so
+
+# Test artifacts
+target_output
+bpfcat_log
+*.test
+
+# Go
+vendor/
+go.sum
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Documentation
+GEMINI.md
+CLAUDE.md
