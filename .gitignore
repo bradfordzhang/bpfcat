@@ -20,7 +20,6 @@ bpfcat_log
 
 # Go
 vendor/
-go.sum
 
 # IDEs and Editors
 .vscode/
