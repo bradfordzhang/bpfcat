@@ -18,10 +18,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var nextIndex uint32
-var activeEbpfConns int32
-var activeUserConns int32
+var (
+	nextIndex       uint32
+	activeEbpfConns int32
+	activeUserConns int32
+	manualBytes     uint64
+)
 
+// parseAddr parses a string and returns the network type and formatted address.
 func parseAddr(s string) (network, addr string) {
 	if strings.HasPrefix(s, "unix:") {
 		return "unix", strings.TrimPrefix(s, "unix:")
@@ -32,7 +36,6 @@ func parseAddr(s string) (network, addr string) {
 	if strings.HasPrefix(s, "udp:") {
 		return "udp", strings.TrimPrefix(s, "udp:")
 	}
-	// Fallback to old behavior
 	if !strings.Contains(s, ":") && !strings.Contains(s, "/") {
 		return "tcp", ":" + s
 	}
@@ -52,7 +55,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Allow the current process to lock memory for eBPF resources.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
@@ -63,19 +65,16 @@ func main() {
 	listenNet, listenAddr := parseAddr(listenStr)
 	dialNet, dialAddr := parseAddr(dialStr)
 
-	// Clean up stale unix sockets
 	if listenNet == "unix" {
 		os.Remove(listenAddr)
 	}
 
-	// Load eBPF objects
 	objs := bpfcatObjects{}
 	if err := loadBpfcatObjects(&objs, nil); err != nil {
 		log.Fatalf("Loading eBPF objects: %v", err)
 	}
 	defer objs.Close()
 
-	// Attach program to map
 	if err := link.RawAttachProgram(link.RawAttachProgramOptions{
 		Target:  objs.SockMap.FD(),
 		Program: objs.BpfcatVerdict,
@@ -84,7 +83,6 @@ func main() {
 		log.Fatalf("Attaching program to map: %v", err)
 	}
 
-	// Start stats reporter
 	go statsLoop(&objs)
 
 	if listenNet == "udp" {
@@ -126,10 +124,8 @@ func listenUDP(listenAddr, dialNet, dialAddr string, objs *bpfcatObjects) {
 
 	fmt.Printf("bpfcat (UDP) listening on udp://%s, forwarding to %s://%s\n", listenAddr, dialNet, dialAddr)
 
-	// Since UDP is connectionless, we use a map to track "sessions" from different clients
 	type session struct {
 		remoteConn net.Conn
-		lastSeen   time.Time
 	}
 	sessions := make(map[string]*session)
 	var mu sync.Mutex
@@ -145,30 +141,27 @@ func listenUDP(listenAddr, dialNet, dialAddr string, objs *bpfcatObjects) {
 		mu.Lock()
 		s, ok := sessions[srcAddr.String()]
 		if !ok {
-			// New UDP session
 			remoteConn, err := net.Dial(dialNet, dialAddr)
-
 			if err != nil {
 				log.Printf("Dial remote error: %v", err)
 				mu.Unlock()
 				continue
 			}
-			s = &session{
-				remoteConn: remoteConn,
-				lastSeen:   time.Now(),
-			}
+			s = &session{remoteConn: remoteConn}
 			sessions[srcAddr.String()] = s
 
-			// Go routine to handle responses from remote to local
 			go func(src *net.UDPAddr, rConn net.Conn) {
+				defer func() {
+					mu.Lock()
+					delete(sessions, src.String())
+					mu.Unlock()
+					rConn.Close()
+				}()
+
 				rBuf := make([]byte, 65535)
 				for {
 					rn, err := rConn.Read(rBuf)
 					if err != nil {
-						mu.Lock()
-						delete(sessions, src.String())
-						mu.Unlock()
-						rConn.Close()
 						return
 					}
 					conn.WriteToUDP(rBuf[:rn], src)
@@ -176,7 +169,6 @@ func listenUDP(listenAddr, dialNet, dialAddr string, objs *bpfcatObjects) {
 				}
 			}(srcAddr, remoteConn)
 		}
-		s.lastSeen = time.Now()
 		mu.Unlock()
 
 		_, err = s.remoteConn.Write(buf[:n])
@@ -197,14 +189,10 @@ func statsLoop(objs *bpfcatObjects) {
 		var bytesValues []uint64
 		var packetsValues []uint64
 
-		// Read total bytes (key 0)
 		if err := objs.Stats.Lookup(uint32(0), &bytesValues); err != nil {
-			log.Printf("Lookup bytes stats: %v", err)
 			continue
 		}
-		// Read total packets (key 1)
 		if err := objs.Stats.Lookup(uint32(1), &packetsValues); err != nil {
-			log.Printf("Lookup packets stats: %v", err)
 			continue
 		}
 
@@ -215,13 +203,10 @@ func statsLoop(objs *bpfcatObjects) {
 		for _, v := range packetsValues {
 			currentPackets += v
 		}
-		// Add user-space manual copy stats
 		currentBytes += atomic.LoadUint64(&manualBytes)
 
 		diffBytes := currentBytes - prevBytes
 		diffPackets := currentPackets - prevPackets
-		
-		// Basic units formatting
 		mbps := float64(diffBytes) * 8 / 1024 / 1024
 		
 		fmt.Printf("\r[Stats] Throughput: %.2f Mbps | QPS: %d | Active: %d (eBPF: %d, User: %d) | Total: %s", 
@@ -246,6 +231,10 @@ func formatBytes(b uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func handleConn(clientConn net.Conn, dialNet, dialAddr string, objs *bpfcatObjects) {
 	defer clientConn.Close()
 
@@ -256,54 +245,29 @@ func handleConn(clientConn net.Conn, dialNet, dialAddr string, objs *bpfcatObjec
 	}
 	defer destConn.Close()
 
-	clientFD, err := getFD(clientConn)
-	if err != nil {
-		log.Printf("Get client FD error: %v", err)
-		return
-	}
-
-	destFD, err := getFD(destConn)
-	if err != nil {
-		log.Printf("Get dest FD error: %v", err)
-		return
-	}
-
-	clientCookie, err := unix.GetsockoptUint64(clientFD, unix.SOL_SOCKET, unix.SO_COOKIE)
-	if err != nil {
-		log.Printf("Get client cookie error: %v", err)
-		return
-	}
-
-	destCookie, err := unix.GetsockoptUint64(destFD, unix.SOL_SOCKET, unix.SO_COOKIE)
-	if err != nil {
-		log.Printf("Get dest cookie error: %v", err)
-		return
-	}
-
-	// Allocate two indices
-	idxA := atomic.AddUint32(&nextIndex, 1) % 65535
-	idxB := atomic.AddUint32(&nextIndex, 1) % 65535
-
 	listenNet := clientConn.LocalAddr().Network()
 	if listenNet == "tcp" && dialNet == "tcp" {
-		// TCP to TCP: Use eBPF for zero-copy
+		clientFD, _ := getFD(clientConn)
+		destFD, _ := getFD(destConn)
+		clientCookie, _ := unix.GetsockoptUint64(clientFD, unix.SOL_SOCKET, unix.SO_COOKIE)
+		destCookie, _ := unix.GetsockoptUint64(destFD, unix.SOL_SOCKET, unix.SO_COOKIE)
+
 		atomic.AddInt32(&activeEbpfConns, 1)
 		defer atomic.AddInt32(&activeEbpfConns, -1)
 
-		if err := objs.CookieToPeerIndex.Update(clientCookie, idxB, ebpf.UpdateAny); err != nil {
-			log.Printf("Update client cookie mapping error: %v", err)
-		}
-		if err := objs.CookieToPeerIndex.Update(destCookie, idxA, ebpf.UpdateAny); err != nil {
-			log.Printf("Update dest cookie mapping error: %v", err)
-		}
-		if err := objs.SockMap.Update(idxA, uint32(clientFD), ebpf.UpdateAny); err != nil {
-			log.Printf("Update client sock_map error: %v", err)
-		}
-		if err := objs.SockMap.Update(idxB, uint32(destFD), ebpf.UpdateAny); err != nil {
-			log.Printf("Update dest sock_map error: %v", err)
-		}
+		idxA := atomic.AddUint32(&nextIndex, 1) % 65535
+		idxB := atomic.AddUint32(&nextIndex, 1) % 65535
 
-		// Wait for closure
+		objs.CookieToPeerIndex.Update(clientCookie, idxB, ebpf.UpdateAny)
+		objs.CookieToPeerIndex.Update(destCookie, idxA, ebpf.UpdateAny)
+		objs.SockMap.Update(idxA, uint32(clientFD), ebpf.UpdateAny)
+		objs.SockMap.Update(idxB, uint32(destFD), ebpf.UpdateAny)
+
+		defer func() {
+			objs.CookieToPeerIndex.Delete(clientCookie)
+			objs.CookieToPeerIndex.Delete(destCookie)
+		}()
+
 		errChan := make(chan error, 1)
 		go func() {
 			buf := make([]byte, 1)
@@ -312,7 +276,6 @@ func handleConn(clientConn net.Conn, dialNet, dialAddr string, objs *bpfcatObjec
 		}()
 		<-errChan
 	} else {
-		// Cross-protocol or Unix: Use User-space copy as fallback
 		atomic.AddInt32(&activeUserConns, 1)
 		defer atomic.AddInt32(&activeUserConns, -1)
 
@@ -322,50 +285,34 @@ func handleConn(clientConn net.Conn, dialNet, dialAddr string, objs *bpfcatObjec
 			defer wg.Done()
 			n, _ := io.Copy(destConn, clientConn)
 			atomic.AddUint64(&manualBytes, uint64(n))
-			if c, ok := destConn.(*net.TCPConn); ok {
-				c.CloseWrite()
+			if cw, ok := destConn.(closeWriter); ok {
+				cw.CloseWrite()
 			}
 		}()
 		go func() {
 			defer wg.Done()
 			n, _ := io.Copy(clientConn, destConn)
 			atomic.AddUint64(&manualBytes, uint64(n))
-			if c, ok := clientConn.(*net.TCPConn); ok {
-				c.CloseWrite()
+			if cw, ok := clientConn.(closeWriter); ok {
+				cw.CloseWrite()
 			}
 		}()
 		wg.Wait()
 	}
-
-	// Cleanup
-	objs.CookieToPeerIndex.Delete(clientCookie)
-	objs.CookieToPeerIndex.Delete(destCookie)
 }
-
-var manualBytes uint64
 
 func getFD(conn net.Conn) (int, error) {
 	sysConn, ok := conn.(syscall.Conn)
 	if !ok {
 		return 0, fmt.Errorf("connection does not support syscall.Conn")
 	}
-
 	rawConn, err := sysConn.SyscallConn()
 	if err != nil {
 		return 0, err
 	}
-
 	var fd int
-	var errControl error
-	err = rawConn.Control(func(f uintptr) {
+	rawConn.Control(func(f uintptr) {
 		fd = int(f)
 	})
-	if err != nil {
-		return 0, err
-	}
-	if errControl != nil {
-		return 0, errControl
-	}
-
 	return fd, nil
 }
