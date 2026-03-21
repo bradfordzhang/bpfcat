@@ -247,10 +247,22 @@ func handleConn(clientConn net.Conn, dialNet, dialAddr string, objs *bpfcatObjec
 
 	listenNet := clientConn.LocalAddr().Network()
 	if listenNet == "tcp" && dialNet == "tcp" {
-		clientFD, _ := getFD(clientConn)
-		destFD, _ := getFD(destConn)
-		clientCookie, _ := unix.GetsockoptUint64(clientFD, unix.SOL_SOCKET, unix.SO_COOKIE)
-		destCookie, _ := unix.GetsockoptUint64(destFD, unix.SOL_SOCKET, unix.SO_COOKIE)
+		clientFD, err := getFD(clientConn)
+		if err != nil {
+			return
+		}
+		destFD, err := getFD(destConn)
+		if err != nil {
+			return
+		}
+		clientCookie, err := unix.GetsockoptUint64(clientFD, unix.SOL_SOCKET, unix.SO_COOKIE)
+		if err != nil {
+			return
+		}
+		destCookie, err := unix.GetsockoptUint64(destFD, unix.SOL_SOCKET, unix.SO_COOKIE)
+		if err != nil {
+			return
+		}
 
 		atomic.AddInt32(&activeEbpfConns, 1)
 		defer atomic.AddInt32(&activeEbpfConns, -1)
@@ -258,14 +270,17 @@ func handleConn(clientConn net.Conn, dialNet, dialAddr string, objs *bpfcatObjec
 		idxA := atomic.AddUint32(&nextIndex, 1) % 65535
 		idxB := atomic.AddUint32(&nextIndex, 1) % 65535
 
-		objs.CookieToPeerIndex.Update(clientCookie, idxB, ebpf.UpdateAny)
-		objs.CookieToPeerIndex.Update(destCookie, idxA, ebpf.UpdateAny)
+		// Update SockMap FIRST, then lookup map. Order matters for race conditions.
 		objs.SockMap.Update(idxA, uint32(clientFD), ebpf.UpdateAny)
 		objs.SockMap.Update(idxB, uint32(destFD), ebpf.UpdateAny)
+		objs.CookieToPeerIndex.Update(clientCookie, idxB, ebpf.UpdateAny)
+		objs.CookieToPeerIndex.Update(destCookie, idxA, ebpf.UpdateAny)
 
 		defer func() {
 			objs.CookieToPeerIndex.Delete(clientCookie)
 			objs.CookieToPeerIndex.Delete(destCookie)
+			objs.SockMap.Delete(idxA)
+			objs.SockMap.Delete(idxB)
 		}()
 
 		errChan := make(chan error, 1)
@@ -311,8 +326,15 @@ func getFD(conn net.Conn) (int, error) {
 		return 0, err
 	}
 	var fd int
-	rawConn.Control(func(f uintptr) {
+	var errControl error
+	err = rawConn.Control(func(f uintptr) {
 		fd = int(f)
 	})
+	if err != nil {
+		return 0, err
+	}
+	if errControl != nil {
+		return 0, errControl
+	}
 	return fd, nil
 }

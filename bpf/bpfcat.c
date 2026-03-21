@@ -39,6 +39,7 @@ int bpfcat_verdict(struct __sk_buff *skb)
 		return SK_PASS;
 	}
 
+	// Update stats
 	__u32 bytes_key = 0;
 	__u32 pkts_key = 1;
 	__u64 *bytes_val = bpf_map_lookup_elem(&stats, &bytes_key);
@@ -49,7 +50,12 @@ int bpfcat_verdict(struct __sk_buff *skb)
 		*pkts_val += 1;
 	}
 
-	return bpf_sk_redirect_map(skb, &sock_map, *peer_idx, 0);
+	// Attempt redirection. If it fails, fallback to user-space (SK_PASS).
+	int ret = bpf_sk_redirect_map(skb, &sock_map, *peer_idx, 0);
+	return (ret == SK_PASS) ? SK_PASS : SK_PASS; 
+	// Note: We always return SK_PASS for now to ensure reliability. 
+	// If redirection is successful, the kernel handles it. 
+	// If it fails, the packet reaches the user-space socket.
 }
 
 char _license[] SEC("license") = "GPL";
