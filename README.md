@@ -33,14 +33,13 @@ To provide a zero-copy forwarding mechanism at the Socket layer using eBPF, acco
 
 ### Prerequisites
 - Linux Kernel 4.17+ (5.4+ recommended)
-- Go 1.21+
+- Go 1.26+
 - Clang & LLVM (for compiling eBPF bytecode)
 
 ### Build
 ```bash
 # Generate eBPF bindings and build the binary
-go generate
-go build -o bpfcat .
+make build
 ```
 
 ### Usage Examples
