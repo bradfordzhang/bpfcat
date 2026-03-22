@@ -1,6 +1,6 @@
 module bpfcat
 
-go 1.24.4
+go 1.26
 
 require (
 	github.com/cilium/ebpf v0.21.0
