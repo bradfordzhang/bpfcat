@@ -1,6 +1,8 @@
 # Binaries
 bpfcat
 bpfcat_test
+bpfcat-*
+dist/
 
 # eBPF Generated files
 # We ignore these because they can be regenerated via 'make'

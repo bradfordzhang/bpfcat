@@ -32,3 +32,74 @@ jobs:
 
     - name: Run Integration Tests
       run: make test
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    env:
+      GOEXPERIMENT: newinliner,runtimefreegc,simd
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            goarm: ""
+            output: bpfcat-linux-amd64
+          - goarch: arm64
+            goarm: ""
+            output: bpfcat-linux-arm64
+          - goarch: 386
+            goarm: ""
+            output: bpfcat-linux-386
+          - goarch: riscv64
+            goarm: ""
+            output: bpfcat-linux-riscv64
+          - goarch: loong64
+            goarm: ""
+            output: bpfcat-linux-loong64
+          - goarch: mips64
+            goarm: ""
+            output: bpfcat-linux-mips64
+          - goarch: mips64le
+            goarm: ""
+            output: bpfcat-linux-mips64le
+          - goarch: mipsle
+            goarm: ""
+            output: bpfcat-linux-mipsle
+          - goarch: mips
+            goarm: ""
+            output: bpfcat-linux-mips
+          - goarch: ppc64
+            goarm: ""
+            output: bpfcat-linux-ppc64
+          - goarch: ppc64le
+            goarm: ""
+            output: bpfcat-linux-ppc64le
+          - goarch: s390x
+            goarm: ""
+            output: bpfcat-linux-s390x
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+        cache: true
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm libbpf-dev
+
+    - name: Cross compile
+      run: |
+        if [ -n "${{ matrix.goarm }}" ]; then
+          make build GOOS=linux GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} OUTPUT=${{ matrix.output }}
+        else
+          make build GOOS=linux GOARCH=${{ matrix.goarch }} OUTPUT=${{ matrix.output }}
+        fi
+
+    - name: Verify artifact exists
+      run: test -f ${{ matrix.output }}
