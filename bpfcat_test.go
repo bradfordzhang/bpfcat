@@ -62,7 +62,7 @@ func TestForwarding(t *testing.T) {
 			// Since we're in the same package, we could also call main or handleConn directly
 			// but that requires more setup. For now, let's verify the helpers.
 			t.Logf("Ready to test %s via %s", actualTargetAddr, tc.listenNet)
-			
+
 			// Simple echo verification
 			payload := []byte("hello eBPF")
 			if tc.dialNet == "tcp" {

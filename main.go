@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,12 +50,20 @@ func parseAddr(s string) (network, addr string) {
 }
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Printf("Usage: %s <listen-addr> <dial-addr>\n", os.Args[0])
-		fmt.Printf("Examples:\n")
+	var ifaceName string
+	var blocklistStr string
+	flag.StringVar(&ifaceName, "i", "", "Network interface for XDP attachment (e.g., eth0)")
+	flag.StringVar(&blocklistStr, "b", "", "Comma-separated list of IPv4 CIDRs to blacklist (e.g., 1.2.3.4/32,10.0.0.0/8)")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 2 {
+		fmt.Printf("Usage: %s [flags] <listen-addr> <dial-addr>\n", os.Args[0])
+		fmt.Printf("Flags:\n")
+		flag.PrintDefaults()
+		fmt.Printf("\nExamples:\n")
 		fmt.Printf("  %s 8888 127.0.0.1:8080\n", os.Args[0])
-		fmt.Printf("  %s udp:9999 udp:127.0.0.1:9090\n", os.Args[0])
-		fmt.Printf("  %s unix:/tmp/listen.sock unix:/tmp/dest.sock\n", os.Args[0])
+		fmt.Printf("  %s -i eth0 -b 10.0.0.0/8 8888 127.0.0.1:8080\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -59,8 +71,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	listenStr := os.Args[1]
-	dialStr := os.Args[2]
+	listenStr := args[0]
+	dialStr := args[1]
 
 	listenNet, listenAddr := parseAddr(listenStr)
 	dialNet, dialAddr := parseAddr(dialStr)
@@ -75,6 +87,88 @@ func main() {
 	}
 	defer objs.Close()
 
+	if listenNet == "tcp" || listenNet == "udp" {
+		_, portStr, err := net.SplitHostPort(listenAddr)
+		if err == nil {
+			port, err := strconv.ParseUint(portStr, 10, 16)
+			if err == nil {
+				var key uint32 = 0
+				val := uint16(port)
+				if err := objs.BpfcatConfig.Update(key, val, ebpf.UpdateAny); err != nil {
+					log.Printf("Warning: failed to set listening port in eBPF config map: %v", err)
+				} else {
+					fmt.Printf("XDP ACL configured to protect port %d\n", val)
+				}
+			}
+		} else {
+			// Try to parse just the port directly if SplitHostPort fails (e.g. if listenAddr is just "8888")
+			port, err := strconv.ParseUint(listenAddr, 10, 16)
+			if err == nil {
+				var key uint32 = 0
+				val := uint16(port)
+				if err := objs.BpfcatConfig.Update(key, val, ebpf.UpdateAny); err != nil {
+					log.Printf("Warning: failed to set listening port in eBPF config map: %v", err)
+				} else {
+					fmt.Printf("XDP ACL configured to protect port %d\n", val)
+				}
+			}
+		}
+	}
+
+	if blocklistStr != "" {
+		cidrs := strings.Split(blocklistStr, ",")
+		for _, cidrStr := range cidrs {
+			cidrStr = strings.TrimSpace(cidrStr)
+			if cidrStr == "" {
+				continue
+			}
+			if !strings.Contains(cidrStr, "/") {
+				cidrStr += "/32"
+			}
+			_, ipNet, err := net.ParseCIDR(cidrStr)
+			if err != nil {
+				log.Fatalf("Invalid CIDR %q: %v", cidrStr, err)
+			}
+
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil {
+				log.Fatalf("Only IPv4 blocklists are supported currently: %q", cidrStr)
+			}
+
+			ones, _ := ipNet.Mask.Size()
+
+			ipData := uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
+
+			key := bpfcatIpv4LpmKey{
+				Prefixlen: uint32(ones),
+				Data:      ipData,
+			}
+
+			var dropVal uint8 = 1
+			if err := objs.AclMap.Update(key, dropVal, ebpf.UpdateAny); err != nil {
+				log.Fatalf("Failed to add %q to ACL map: %v", cidrStr, err)
+			}
+			fmt.Printf("Added %s to XDP drop list\n", cidrStr)
+		}
+	}
+
+	if ifaceName != "" {
+		iface, err := net.InterfaceByName(ifaceName)
+		if err != nil {
+			log.Fatalf("Interface %q not found: %v", ifaceName, err)
+		}
+
+		l, err := link.AttachXDP(link.XDPOptions{
+			Program:   objs.BpfcatXdp,
+			Interface: iface.Index,
+		})
+		if err != nil {
+			log.Fatalf("Attaching XDP program: %v", err)
+		}
+		defer l.Close()
+		fmt.Printf("Attached XDP ACL program to %s\n", ifaceName)
+	}
+
 	if err := link.RawAttachProgram(link.RawAttachProgramOptions{
 		Target:  objs.SockMap.FD(),
 		Program: objs.BpfcatVerdict,
@@ -85,20 +179,40 @@ func main() {
 
 	go statsLoop(&objs)
 
+	// Setup graceful shutdown to trigger defers
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		fmt.Println("\nReceived termination signal, shutting down gracefully...")
+		cancel()
+	}()
+
 	if listenNet == "udp" {
-		listenUDP(listenAddr, dialNet, dialAddr, &objs)
+		listenUDP(ctx, listenAddr, dialNet, dialAddr, &objs)
 	} else {
 		ln, err := net.Listen(listenNet, listenAddr)
 		if err != nil {
 			log.Fatalf("Listen (%s): %v", listenNet, err)
 		}
-		defer ln.Close()
+
+		go func() {
+			<-ctx.Done()
+			ln.Close()
+		}()
 
 		fmt.Printf("bpfcat (Multi-Protocol) listening on %s://%s, forwarding to %s://%s\n", listenNet, listenAddr, dialNet, dialAddr)
 
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
+				if ctx.Err() != nil {
+					// Expected error on shutdown
+					break
+				}
 				log.Printf("Accept error: %v", err)
 				continue
 			}
@@ -107,7 +221,7 @@ func main() {
 	}
 }
 
-func listenUDP(listenAddr, dialNet, dialAddr string, objs *bpfcatObjects) {
+func listenUDP(ctx context.Context, listenAddr, dialNet, dialAddr string, objs *bpfcatObjects) {
 	if !strings.Contains(listenAddr, ":") {
 		listenAddr = ":" + listenAddr
 	}
@@ -122,6 +236,11 @@ func listenUDP(listenAddr, dialNet, dialAddr string, objs *bpfcatObjects) {
 	}
 	defer conn.Close()
 
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	fmt.Printf("bpfcat (UDP) listening on udp://%s, forwarding to %s://%s\n", listenAddr, dialNet, dialAddr)
 
 	type session struct {
@@ -134,6 +253,9 @@ func listenUDP(listenAddr, dialNet, dialAddr string, objs *bpfcatObjects) {
 	for {
 		n, srcAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
 			log.Printf("Read from UDP error: %v", err)
 			continue
 		}
@@ -188,6 +310,7 @@ func statsLoop(objs *bpfcatObjects) {
 	for range ticker.C {
 		var bytesValues []uint64
 		var packetsValues []uint64
+		var aclDropValues []uint64
 
 		if err := objs.Stats.Lookup(uint32(0), &bytesValues); err != nil {
 			continue
@@ -196,28 +319,33 @@ func statsLoop(objs *bpfcatObjects) {
 			continue
 		}
 
-		var currentBytes, currentPackets uint64
+		// It's ok if this fails, ACL map might be empty or not attached if not using -b
+		objs.AclStats.Lookup(uint32(0), &aclDropValues)
+
+		var currentBytes, currentPackets, currentAclDrops uint64
 		for _, v := range bytesValues {
 			currentBytes += v
 		}
 		for _, v := range packetsValues {
 			currentPackets += v
 		}
+		for _, v := range aclDropValues {
+			currentAclDrops += v
+		}
 		currentBytes += atomic.LoadUint64(&manualBytes)
 
 		diffBytes := currentBytes - prevBytes
 		diffPackets := currentPackets - prevPackets
 		mbps := float64(diffBytes) * 8 / 1024 / 1024
-		
-		fmt.Printf("\r[Stats] Throughput: %.2f Mbps | QPS: %d | Active: %d (eBPF: %d, User: %d) | Total: %s", 
+
+		fmt.Printf("\r[Stats] Throughput: %.2f Mbps | QPS: %d | Active: %d (eBPF: %d, User: %d) | ACL Drops: %d | Total: %s", 
 			mbps, diffPackets, atomic.LoadInt32(&activeEbpfConns)+atomic.LoadInt32(&activeUserConns), 
-			atomic.LoadInt32(&activeEbpfConns), atomic.LoadInt32(&activeUserConns), formatBytes(currentBytes))
-		
+			atomic.LoadInt32(&activeEbpfConns), atomic.LoadInt32(&activeUserConns), currentAclDrops, formatBytes(currentBytes))
+
 		prevBytes = currentBytes
 		prevPackets = currentPackets
 	}
 }
-
 func formatBytes(b uint64) string {
 	const unit = 1024
 	if b < unit {
